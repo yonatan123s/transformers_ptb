@@ -1,145 +1,110 @@
-# main.py
-
-import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from data import PTBDataset
-from model import GPTModel
-from utils import save_checkpoint, load_checkpoint, compute_perplexity
-
-def train(args):
-    # Load datasets
-    train_dataset = PTBDataset(f'{args.data_dir}/train.txt', seq_length=args.seq_length)
-    vocab = train_dataset.word2idx
-    valid_dataset = PTBDataset(f'{args.data_dir}/valid.txt', vocab=vocab, seq_length=args.seq_length)
-    test_dataset = PTBDataset(f'{args.data_dir}/test.txt', vocab=vocab, seq_length=args.seq_length)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    model = GPTModel(
-        vocab_size=len(vocab),
-        embed_size=args.embed_size,
-        num_heads=args.num_heads,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        max_seq_length=args.seq_length,
-        dropout=args.dropout
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    best_valid_ppl = float('inf')
-
-    for epoch in range(1, args.epochs + 1):
-        # Training
-        model.train()
-        total_loss = 0
-        for inputs, targets in train_loader:
-            # In the training loop, after loading inputs
-            assert torch.min(inputs) >= 0, "Input contains negative indices."
-            assert torch.max(inputs) < len(vocab), "Input contains indices larger than vocab size."
-
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            # outputs shape: (batch_size, seq_length, vocab_size)
-            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        train_ppl = compute_perplexity(total_loss, len(train_loader))
-
-        # Validation
-        valid_ppl = evaluate(model, valid_loader, criterion, device)
-
-        # Testing
-        test_ppl = evaluate(model, test_loader, criterion, device)
-
-        print(f'Epoch {epoch}: Train PPL: {train_ppl:.4f}, Valid PPL: {valid_ppl:.4f}, Test PPL: {test_ppl:.4f}')
-
-        # Save best model
-        if valid_ppl < best_valid_ppl:
-            best_valid_ppl = valid_ppl
-            save_checkpoint(model, args.cp_path)
-
-def evaluate(model, data_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for inputs, targets in data_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
-            total_loss += loss.item()
-    ppl = compute_perplexity(total_loss, len(data_loader))
-    return ppl
-
-def test(args):
-    # Load vocab
-    train_dataset = PTBDataset(f'{args.data_dir}/train.txt', seq_length=args.seq_length)
-    vocab = train_dataset.word2idx
-    idx2word = train_dataset.idx2word
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    model = GPTModel(
-        vocab_size=len(vocab),
-        embed_size=args.embed_size,
-        num_heads=args.num_heads,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        max_seq_length=args.seq_length,
-        dropout=args.dropout
-    ).to(device)
-
-    load_checkpoint(model, args.cp_path)
-    model.eval()
-
-    print('Enter a sentence to generate the next word (type "quit" to exit):')
-
-    while True:
-        input_text = input('Input: ')
-        if input_text.lower() == 'quit':
-            break
-        tokens = input_text.strip().split()
-        tokens_idx = [vocab.get(token, vocab['<unk>']) for token in tokens]
-        inputs = torch.tensor(tokens_idx, dtype=torch.long).unsqueeze(0).to(device)
-        with torch.no_grad():
-            outputs = model(inputs)
-            next_token_logits = outputs[0, -1, :]
-            next_token_id = torch.argmax(next_token_logits).item()
-            next_token = idx2word[next_token_id]
-            print(f'Next word: {next_token}')
+import torch.optim as optim
+import argparse
+import time
+import math
+from data import PTBDataset, batchify
+from model import TransformerModel
+from train import train, evaluate
+import os
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='ptbdataset')
-    parser.add_argument('--seq_length', type=int, default=32)
-    parser.add_argument('--embed_size', type=int, default=128)
-    parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--hidden_size', type=int, default=512)
-    parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
-    parser.add_argument('--cp_path', type=str, default='best_model.pt')
+    parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model with Lipschitz Regularization')
+    parser.add_argument('--data', type=str, default='ptbdataset',
+                        help='location of the data corpus')
+    parser.add_argument('--embed_size', type=int, default=200,
+                        help='size of word embeddings')
+    parser.add_argument('--nhid', type=int, default=200,
+                        help='number of hidden units per layer')
+    parser.add_argument('--nlayers', type=int, default=2,
+                        help='number of layers')
+    parser.add_argument('--nhead', type=int, default=2,
+                        help='number of heads in the Transformer encoder')
+    parser.add_argument('--lr', type=float, default=5.0,
+                        help='initial learning rate')
+    parser.add_argument('--epochs', type=int, default=40,
+                        help='upper epoch limit')
+    parser.add_argument('--batch_size', type=int, default=20, metavar='N',
+                        help='batch size')
+    parser.add_argument('--bptt', type=int, default=35,
+                        help='sequence length')
+    parser.add_argument('--dropout', type=float, default=0.2,
+                        help='dropout applied to layers (0 = no dropout)')
+    parser.add_argument('--cuda', action='store_true',
+                        help='use CUDA')
+    parser.add_argument('--seed', type=int, default=1111,
+                        help='random seed')
     args = parser.parse_args()
 
-    if args.mode == 'train':
-        train(args)
-    elif args.mode == 'test':
-        test(args)
+    # Set the random seed manually for reproducibility.
+    torch.manual_seed(args.seed)
+
+    device = torch.device("cuda" if args.cuda else "cpu")
+
+    # Load data
+    train_dataset = PTBDataset(os.path.join(args.data, 'train.txt'))
+    vocab = train_dataset
+    valid_dataset = PTBDataset(os.path.join(args.data, 'valid.txt'), vocab)
+    test_dataset = PTBDataset(os.path.join(args.data, 'test.txt'), vocab)
+
+    train_data = torch.tensor(train_dataset.data, dtype=torch.long)
+    val_data = torch.tensor(valid_dataset.data, dtype=torch.long)
+    test_data = torch.tensor(test_dataset.data, dtype=torch.long)
+
+    train_data = batchify(train_data, args.batch_size, device)
+    val_data = batchify(val_data, args.batch_size, device)
+    test_data = batchify(test_data, args.batch_size, device)
+
+    ntokens = len(vocab.word2idx)
+
+    model = TransformerModel(ntokens, args.embed_size, args.nhead, args.nhid, args.nlayers, args.dropout).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
+
+    best_val_loss = None
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start_time = time.time()
+        train_loss = train(model, train_data, criterion, optimizer, scheduler, epoch, args.bptt, device)
+        train_ppl = math.exp(train_loss)
+        val_loss = evaluate(model, val_data, criterion, args.bptt, device)
+        val_ppl = math.exp(val_loss)
+        test_loss = evaluate(model, test_data, criterion, args.bptt, device)
+        test_ppl = math.exp(test_loss)
+        print('-' * 89)
+        print('| end of epoch {:3d} | time: {:5.2f}s | '
+              'train loss {:5.2f} | train ppl {:8.2f} | '
+              'valid loss {:5.2f} | valid ppl {:8.2f} | '
+              'test loss {:5.2f} | test ppl {:8.2f}'.format(
+            epoch, (time.time() - epoch_start_time),
+            train_loss, train_ppl,
+            val_loss, val_ppl,
+            test_loss, test_ppl))
+        print('-' * 89)
+
+        if not best_val_loss or val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # Save the model
+            with open('model.pt', 'wb') as f:
+                torch.save(model.state_dict(), f)
+        else:
+            # Anneal the learning rate if no improvement has been seen in the validation dataset.
+            scheduler.step()
+
+    # Load the best saved model.
+    with open('model.pt', 'rb') as f:
+        model.load_state_dict(torch.load(f))
+
+    # Run on test data.
+    test_loss = evaluate(model, test_data, criterion, args.bptt, device)
+    test_ppl = math.exp(test_loss)
+    print('=' * 89)
+    print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+        test_loss, test_ppl))
+    print('=' * 89)
 
 if __name__ == '__main__':
     main()

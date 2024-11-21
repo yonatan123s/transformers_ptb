@@ -1,58 +1,59 @@
-# model.py
-
 import torch
 import torch.nn as nn
+import math
+from torch.nn.utils import spectral_norm
 
-class GPTModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, hidden_size, num_layers, max_seq_length, dropout=0.1):
-        super(GPTModel, self).__init__()
-        self.token_embedding = nn.Embedding(vocab_size, embed_size)
-        self.positional_embedding = nn.Embedding(max_seq_length, embed_size)
-        self.layers = nn.ModuleList([
-            TransformerBlock(embed_size, num_heads, hidden_size, dropout)
-            for _ in range(num_layers)
-        ])
-        self.layer_norm = nn.LayerNorm(embed_size)
-        self.fc_out = nn.Linear(embed_size, vocab_size)
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_size, dropout=0.5, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x):
-        seq_length = x.size(1)
-        positions = torch.arange(0, seq_length, device=x.device).unsqueeze(0)
-        x = self.token_embedding(x) + self.positional_embedding(positions)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.layer_norm(x)
-        logits = self.fc_out(x)
-        return logits
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_size, num_heads, hidden_size, dropout):
-        super(TransformerBlock, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout, batch_first=True)
-        self.layer_norm1 = nn.LayerNorm(embed_size)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(embed_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, embed_size)
-        )
-        self.layer_norm2 = nn.LayerNorm(embed_size)
-        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, embed_size)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_size, 2).float() * (-math.log(10000.0) / embed_size))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if embed_size % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_length, embed_size)
-        seq_length = x.size(1)
-        attn_output, _ = self.attention(
-            x, x, x,
-            attn_mask=self._generate_subsequent_mask(seq_length).to(x.device)
-        )
-        x = x + self.dropout(attn_output)
-        x = self.layer_norm1(x)
-        ff_output = self.feed_forward(x)
-        x = x + self.dropout(ff_output)
-        x = self.layer_norm2(x)
-        return x
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
-    def _generate_subsequent_mask(self, size):
-        mask = torch.triu(torch.full((size, size), float('-inf')), diagonal=1)
-        return mask  # Shape: (seq_length, seq_length)
+class TransformerModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, nhead, nhid, nlayers, dropout=0.5):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.src_mask = None
+        self.pos_encoder = PositionalEncoding(embed_size, dropout)
+        encoder_layers = nn.TransformerEncoderLayer(embed_size, nhead, nhid, dropout)
+        # Apply spectral normalization to the linear layers in encoder layers
+        for attr in dir(encoder_layers):
+            module = getattr(encoder_layers, attr)
+            if isinstance(module, nn.Linear):
+                setattr(encoder_layers, attr, spectral_norm(module))
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
+        self.encoder = nn.Embedding(vocab_size, embed_size)
+        self.embed_size = embed_size
+        self.decoder = spectral_norm(nn.Linear(embed_size, vocab_size))
 
+        self.init_weights()
+
+    def _generate_square_subsequent_mask(self, sz):
+        return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
+
+    def init_weights(self):
+        initrange = 0.1
+        nn.init.uniform_(self.encoder.weight, -initrange, initrange)
+        nn.init.zeros_(self.decoder.bias)
+        nn.init.uniform_(self.decoder.weight, -initrange, initrange)
+
+    def forward(self, src, src_mask):
+        src = self.encoder(src) * math.sqrt(self.embed_size)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src, src_mask)
+        output = self.decoder(output)
+        return output

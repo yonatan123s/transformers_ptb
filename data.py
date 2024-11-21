@@ -1,50 +1,34 @@
-# data.py
-
 import torch
 from torch.utils.data import Dataset
+from collections import Counter
+import os
 
 class PTBDataset(Dataset):
-    def __init__(self, file_path, vocab=None, seq_length=32):
-        with open(file_path, 'r') as f:
+    def __init__(self, data_path, vocab=None):
+        with open(data_path, 'r') as f:
             text = f.read()
-        self.tokens = text.split()
-        self.seq_length = seq_length
 
+        self.tokens = text.replace('\n', '<eos>').split()
         if vocab is None:
             self.build_vocab()
-            self.data = [self.word2idx.get(token, self.word2idx['<unk>']) for token in self.tokens]
-            unknown_count = 0
-            for token in self.tokens:
-                idx = self.word2idx.get(token, self.word2idx['<unk>'])
-                if idx == self.word2idx['<unk>']:
-                    unknown_count += 1
-                self.data.append(idx)
-
-            print(f"Number of unknown tokens: {unknown_count} out of {len(self.tokens)} tokens")
-
         else:
-            self.word2idx = vocab
-            self.idx2word = {idx: word for word, idx in self.word2idx.items()}
-            self.data = [self.word2idx.get(token, self.word2idx['<unk>']) for token in self.tokens]
+            self.word2idx = vocab.word2idx
+            self.idx2word = vocab.idx2word
+
+        self.data = [self.word2idx.get(token, self.word2idx['<unk>']) for token in self.tokens]
 
     def build_vocab(self):
-        tokens_set = set(self.tokens)
-        tokens_set.discard('<pad>')
-        tokens_set.discard('<unk>')
-        vocab = ['<pad>', '<unk>'] + sorted(tokens_set)
-        self.word2idx = {word: idx for idx, word in enumerate(vocab)}
-        self.idx2word = {idx: word for word, idx in self.word2idx.items()}
+        counter = Counter(self.tokens)
+        counter['<unk>'] = 0  # Ensure '<unk>' is in vocab
+        vocab = sorted(counter.items(), key=lambda x: -x[1])
+        self.idx2word = [word for word, freq in vocab]
+        self.word2idx = {word: idx for idx, word in enumerate(self.idx2word)}
 
     def __len__(self):
-        return (len(self.data) - self.seq_length - 1) // self.seq_length + 1
+        return len(self.data)
 
-    def __getitem__(self, idx):
-        start_idx = idx * self.seq_length
-        end_idx = start_idx + self.seq_length
-        if end_idx + 1 > len(self.data):
-            end_idx = len(self.data) - 2  # Adjust to prevent out-of-bounds
-            start_idx = end_idx - self.seq_length  # Ensure sequence length remains consistent
-        x = torch.tensor(self.data[start_idx:end_idx], dtype=torch.long)
-        y = torch.tensor(self.data[start_idx + 1:end_idx + 1], dtype=torch.long)
-        return x, y
-
+def batchify(data, batch_size, device):
+    nbatch = data.size(0) // batch_size
+    data = data.narrow(0, 0, nbatch * batch_size)
+    data = data.view(batch_size, -1).t().contiguous()
+    return data.to(device)
